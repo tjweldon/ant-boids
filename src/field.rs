@@ -1,22 +1,23 @@
-use bevy::prelude::*;
+use bevy::{prelude::*, reflect::Enum};
+use std::fmt::Debug;
 
 use crate::ant::SignalKind;
 
 #[derive(Resource)]
 pub struct Signals {
-    pub exploring: Vec2Field,
-    pub retrieving: Vec2Field,
+    pub exploring: Vec2Field<SignalKind>,
+    pub retrieving: Vec2Field<SignalKind>,
 }
 
 impl Signals {
-    pub fn get_field(&self, kind: SignalKind) -> &Vec2Field {
+    pub fn get_field(&self, kind: SignalKind) -> &Vec2Field<SignalKind> {
         match kind {
             SignalKind::Exploring => &self.exploring,
             SignalKind::Retrieving => &self.retrieving,
         }
     }
 
-    pub fn get_mut_field(&mut self, kind: SignalKind) -> &mut Vec2Field {
+    pub fn get_mut_field(&mut self, kind: SignalKind) -> &mut Vec2Field<SignalKind> {
         match kind {
             SignalKind::Exploring => &mut self.exploring,
             SignalKind::Retrieving => &mut self.retrieving,
@@ -29,6 +30,67 @@ impl Signals {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+#[repr(u8)]
+pub enum FoodType {
+    Yummy
+}
+
+#[derive(Resource)]
+pub struct Food {
+    pub amount: Field<FoodType>,
+}
+
+impl Food {
+    pub fn new(lattice: Vec2, size: Vec2) -> Self {
+        Self {
+            amount: Field::<FoodType>::new(
+                FoodType::Yummy,
+                lattice,
+                size
+            ),
+        }
+    }
+
+    pub fn get_cells(&mut self) -> &[Cell] {
+        self.amount.get_cells()
+    }
+
+    pub fn put(&mut self, area: Rect, depth: f32) {
+        let area = Rect::from_center_size(Vec2::ZERO, self.amount.size).intersect(area);
+        let along = self.amount.lattice.project_onto(Vec2::X);
+        let up = self.amount.lattice.project_onto(Vec2::Y);
+        let region_size = area.width() * area.height();
+        
+        let cell_size = self.amount.lattice.x * self.amount.lattice.y;
+        let cell_count = region_size as f32 / cell_size as f32;
+
+        let walk_start = 0.* along + 0.* up + area.min + 0.5 * self.amount.lattice;
+        let mut cursor = walk_start.clone();
+        for _ in 0..cell_count as usize {
+            self.amount.set_cell_value(depth, cursor);
+
+            // move along until out of area, then start again but above, break if that's outside
+            match area.contains(cursor + along) {
+                true => {
+                    cursor = cursor + along
+                },
+                false => {
+                    cursor = walk_start.project_onto(Vec2::X) + (cursor + up).project_onto(Vec2::Y)
+                }
+            };
+
+            if !area.contains(cursor) {
+                break;
+            }
+        }
+    }
+
+    pub fn update(&mut self, &dt: &f32) {
+        self.amount.update(0.0001, 0., &dt);
+    }
+}
+
 #[derive(Copy, Clone, Debug, Component)]
 pub struct Cell {
     pub region: Rect,
@@ -36,7 +98,7 @@ pub struct Cell {
 }
 
 impl Cell {
-    pub fn read_from(&mut self, field: &Field) {
+    pub fn read_from(&mut self, field: & impl Cellular<f32>) {
         self.val = field.get_cell_value(self.region.center());
     }
 }
@@ -48,9 +110,13 @@ pub struct Vec2Cell {
 }
 
 impl Vec2Cell {
-    pub fn read_from(&mut self, field: &Vec2Field) {
+    pub fn read_from(&mut self, field: & impl Cellular<Vec2>) {
         self.val = field.get_cell_value(self.region.center());
     }
+}
+
+pub trait Cellular<C> {
+    fn get_cell_value(&self, pos: Vec2) -> C;
 }
 
 #[derive(Copy, Clone)]
@@ -86,15 +152,15 @@ impl LatticeIndexer {
 }
 
 #[derive(Resource)]
-pub struct Vec2Field {
-    pub kind: SignalKind,
-    x: Field,
-    y: Field,
+pub struct Vec2Field<T: Copy + Clone + Debug> {
+    pub kind: T,
+    x: Field<T>,
+    y: Field<T>,
     cell_cache: Vec<Vec2Cell>,
 }
 
-impl Vec2Field {
-    pub fn new(kind: SignalKind, lattice: Vec2, size: Vec2) -> Self {
+impl<T: Copy + Clone + Debug> Vec2Field<T> {
+    pub fn new(kind: T, lattice: Vec2, size: Vec2) -> Self {
         Self {
             kind,
             x: Field::new(kind, lattice.clone(), size.clone()),
@@ -136,12 +202,6 @@ impl Vec2Field {
         self.y.update(diffusion_rate, evapouration_rate, &dt);
     }
 
-    pub fn get_cell_value(&self, pos: Vec2) -> Vec2 {
-        Vec2::new(
-            self.x.get_cell_value(pos.clone()),
-            self.y.get_cell_value(pos),
-        )
-    }
 
     pub fn sample(&self, pos: Vec2) -> Vec2 {
         self.get_cell_value(pos)
@@ -166,9 +226,18 @@ impl Vec2Field {
     }
 }
 
+impl<T: Copy + Clone + Debug> Cellular<Vec2> for Vec2Field<T> {
+    fn get_cell_value(&self, pos: Vec2) -> Vec2 {
+        Vec2::new(
+            self.x.get_cell_value(pos.clone()),
+            self.y.get_cell_value(pos),
+        )
+    }
+}
+
 #[derive(Resource)]
-pub struct Field {
-    pub kind: SignalKind,
+pub struct Field<T: Copy + Clone + Debug> {
+    pub kind: T,
     pub lattice: Vec2,
     pub size: Vec2,
     pub dimensions: LatticeIndexer,
@@ -176,8 +245,8 @@ pub struct Field {
     cell_cache: Vec<Cell>,
 }
 
-impl Field {
-    pub fn new(kind: SignalKind, lattice: Vec2, size: Vec2) -> Self {
+impl<T: Copy + Clone + Debug> Field<T> {
+    pub fn new(kind: T, lattice: Vec2, size: Vec2) -> Self {
         if lattice.x == 0f32 || lattice.y == 0f32 {
             panic!("Only nonzero x and y allowed for lattice vector. Got {lattice:?}");
         }
@@ -225,13 +294,6 @@ impl Field {
         (cell_pos.x as usize, cell_pos.y as usize)
     }
 
-    pub fn get_cell_value(&self, at_pos: Vec2) -> f32 {
-        let (x_idx, y_idx) = self.pos_to_lattice_idx(at_pos);
-        match self.value_lookup(x_idx, y_idx) {
-            Some(val) => val,
-            None => 0f32,
-        }
-    }
 
     pub fn get_cells(&mut self) -> &[Cell] {
         if self.cell_cache.len() != self.cells.len() {
@@ -331,5 +393,15 @@ impl Field {
 
         self.cells = new_cells;
         self.reset_cache();
+    }
+}
+
+impl<T: Copy + Clone + Debug> Cellular<f32> for Field<T> {
+    fn get_cell_value(&self, at_pos: Vec2) -> f32 {
+        let (x_idx, y_idx) = self.pos_to_lattice_idx(at_pos);
+        match self.value_lookup(x_idx, y_idx) {
+            Some(val) => val,
+            None => 0f32,
+        }
     }
 }

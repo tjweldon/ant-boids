@@ -4,30 +4,49 @@ mod field;
 use ant::Ant;
 use ant::SignalKind;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::*;
+use field::{Food, Cellular, Cell};
 use field::Signals;
 use field::Vec2Field;
 use rand_core::RngCore;
 
 const RESOLUTION: (f32, f32) = (1920f32, 1080f32);
-const INDICATOR_VISIBILITY: [(SignalKind, Visibility); 2] = [
-    (SignalKind::Exploring, Visibility::Hidden),
-    (SignalKind::Retrieving, Visibility::Hidden),
-];
 
-fn is_visible(kind: SignalKind) -> Visibility {
-    for (cmp, vis) in INDICATOR_VISIBILITY {
-        if cmp == kind {
-            return vis;
+#[derive(Component)]
+struct Inventory {
+    pub capacity: f32,
+    pub contents: f32,
+}
+
+impl Inventory {
+    pub fn new(capacity: f32) -> Self {
+        Self {
+            capacity,
+            contents: 0f32,
         }
     }
 
-    return Visibility::Hidden;
-}
+    pub fn is_full(&self) -> bool {
+        return self.contents > 0.5 * self.capacity;
+    }
 
-#[derive(Component)]
-struct SignalIndicator(Vec2, SignalKind);
+    pub fn get_space(&self) -> f32 {
+        self.capacity - self.contents
+    }
+
+    pub fn fill_from(&mut self, position: Vec2, source: &mut Food) {
+        let available = source.amount.get_cell_value(position.clone());
+        if available > self.get_space() {
+            source.amount.set_cell_value(available - self.get_space(), position.clone());
+            self.contents = self.capacity;
+        } else {
+            source.amount.set_cell_value(0f32, position);
+            self.contents += available;
+        }
+    }
+}
 
 fn main() {
     sim();
@@ -47,20 +66,28 @@ fn sim() {
                 Vec2::new(RESOLUTION.0, RESOLUTION.1),
             ),
         })
+        .insert_resource(
+            Food::new(
+                Vec2::splat(10.0),
+                Vec2::new(RESOLUTION.0, RESOLUTION.1),
+            )
+        )
         .add_plugins(EntropyPlugin::<ChaCha8Rng>::default())
         .add_plugins(DefaultPlugins)
         .add_systems(Startup, setup)
         .add_systems(Update, update_ants)
         .add_systems(Update, leave_signals)
-        .add_systems(Update, update_indicators)
+        .add_systems(Update, take_food)
+        .add_systems(Update, update_cells)
+        .add_systems(Update, put_food)
         .run();
 }
 
 fn setup(
-    mut signals: ResMut<Signals>,
     mut windows: Query<&mut Window>,
     mut commands: Commands,
     mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
+    mut food: ResMut<Food>,
 ) {
     let mut primary_window = windows.single_mut();
 
@@ -69,54 +96,40 @@ fn setup(
         .resolution
         .set_physical_resolution(RESOLUTION.0 as u32, RESOLUTION.1 as u32);
     commands.spawn(Camera2dBundle::default());
-    for i in 0..1000 {
-        let kind = match i % 10 {
-            0..=2 => SignalKind::Retrieving,
-            _ => SignalKind::Exploring,
-        };
-
-        commands.spawn(EntityFactories::ant_factory(kind, &mut rng));
-
-        for pos in indicator_grid() {
-            commands.spawn(EntityFactories::indicator(
-                pos.clone(),
-                SignalKind::Exploring,
-                Color::RED,
-            ));
-            commands.spawn(EntityFactories::indicator(
-                pos.clone(),
-                SignalKind::Retrieving,
-                Color::GREEN,
-            ));
-        }
-        signals.update(&1.0);
+    for _ in 0..1000 {
+        commands.spawn(EntityFactories::ant_factory(&mut rng));
     }
-}
-
-fn indicator_grid() -> Vec<Vec2> {
-    let mut places: Vec<Vec2> = vec![];
-    let x_step = RESOLUTION.0 / 32f32;
-    let y_step = RESOLUTION.1 / 18f32;
-    for x in (-16..16).map(|xx| xx as f32 * x_step) {
-        for y in (-9..9).map(|yy| yy as f32 * y_step) {
-            places.push(Vec2::new(x, y))
-        }
+    let food_places = [
+        Rect::from_center_size(Vec2::ZERO, Vec2::splat(400.)),
+    ];
+    let food_depth = 10.;
+    for area in food_places {
+        food.put(area, food_depth);
     }
 
-    places
+    let cells = food.get_cells();
+    for cell in cells {
+        commands.spawn((
+            cell.clone(),
+            SpriteBundle {
+                sprite: Sprite {
+                    rect: Some(cell.region),
+                    color: Color::rgb(0., 0.0, cell.val/10.0),
+                    ..default()
+                },
+                transform: Transform::from_xyz(cell.region.center().x, cell.region.center().y, -0.1),
+                ..default()
+            }
+        ));
+    }
 }
 
 struct EntityFactories;
 
 impl EntityFactories {
     pub fn ant_factory(
-        kind: SignalKind,
         rng: &mut ResMut<GlobalEntropy<ChaCha8Rng>>,
-    ) -> (SpriteBundle, Ant, SignalKind) {
-        let colour = match kind {
-            SignalKind::Exploring => Color::RED,
-            SignalKind::Retrieving => Color::GREEN,
-        };
+    ) -> (SpriteBundle, Ant, Inventory) {
         let x = 0.8 * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5) * RESOLUTION.0;
         let y = 0.8 * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5) * RESOLUTION.1;
         let theta = 360f32.to_radians() * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5);
@@ -125,12 +138,12 @@ impl EntityFactories {
         ant.position.y = y;
 
         ant.velocity = ant.velocity.rotate(Vec2::from_angle(theta));
-        ant.state = kind.clone();
+        ant.state = SignalKind::Exploring;
 
         (
             SpriteBundle {
                 sprite: Sprite {
-                    color: colour,
+                    color: Color::RED,
                     custom_size: Some(0.01 * Vec2::new(1920.0, 1080.0)),
                     ..default()
                 },
@@ -139,68 +152,26 @@ impl EntityFactories {
                 ..default()
             },
             ant,
-            kind,
-        )
-    }
-
-    pub fn indicator(
-        pos: Vec2,
-        kind: SignalKind,
-        colour: Color,
-    ) -> (SpriteBundle, SignalIndicator) {
-        (
-            SpriteBundle {
-                sprite: Sprite {
-                    color: colour,
-                    rect: Some(Rect {
-                        min: Vec2::splat(0.0),
-                        max: Vec2::new(3., 3.),
-                    }),
-                    ..default()
-                },
-                transform: Transform::from_translation(pos.extend(0.0)),
-                visibility: is_visible(kind),
-                ..default()
-            },
-            SignalIndicator(pos, kind),
+            Inventory::new(2f32),
         )
     }
 }
 
-fn update_indicators(
-    mut query: Query<(&mut Transform, &SignalIndicator, &Visibility)>,
-    signals: Res<Signals>,
-    time: Res<Time>,
-) {
-    for (mut transform, indicator, vis) in &mut query {
-        if vis == Visibility::Hidden {
-            continue;
-        }
-        let sample = signals.get_field(indicator.1).sample(indicator.0);
-        let initial = transform.local_x().truncate();
-        let norm = sample.normalize_or_zero();
-        if norm == Vec2::ZERO {
-            continue;
-        }
-        let angle = norm.angle_between(initial);
-        if !f32::is_nan(angle) {
-            transform.rotate(Quat::from_rotation_z(-time.delta_seconds() * angle));
-        }
-        transform.translation = indicator.0.extend(0.0);
-
-        transform.scale.x = sample.length().log(2.);
-        transform.scale.y = (sample.length()).min(1.);
-    }
-}
 
 fn update_ants(
     mut signals: ResMut<Signals>,
-    mut query: Query<(&mut Transform, &mut Ant)>,
+    mut query: Query<(&mut Transform, &mut Ant, &mut Inventory, &mut Sprite)>,
     time: Res<Time>,
 ) {
     let dt = time.delta_seconds();
     signals.update(&dt);
-    for (mut transform, mut ant) in &mut query {
+    for (mut transform, mut ant, mut inventory, mut sprite) in &mut query {
+        inventory.contents = inventory.contents - 0.1 * dt;
+        inventory.contents = inventory.contents.max(0f32);
+        if !inventory.is_full() {
+            ant.state = SignalKind::Exploring;
+            sprite.color = Color::RED;
+        }
         let old_heading = ant.velocity.normalize();
         ant.update(&mut signals, &dt);
         let res = Vec2::new(RESOLUTION.0, RESOLUTION.1);
@@ -215,16 +186,54 @@ fn update_ants(
     }
 }
 
+fn update_cells(
+    mut query: Query<(&mut Cell, &mut Sprite)>,
+    food: Res<Food>,
+) {
+    for (mut cell, mut sprite) in &mut query {
+        cell.read_from(&food.amount);
+        sprite.color.set_b(cell.val/10f32);
+    }
+}
+
 fn leave_signals(
     mut signals: ResMut<Signals>,
-    mut query: Query<(&mut Ant, &SignalKind), With<Transform>>,
+    mut query: Query<&mut Ant, With<Transform>>,
 ) {
-    for (mut ant, &kind) in &mut query {
-        ant.state = kind;
+    for ant in &mut query {
         ant.leave_signal(&mut signals);
-        if kind == SignalKind::Retrieving {
-            ant.leave_signal(&mut signals);
-            ant.leave_signal(&mut signals);
+    }
+}
+
+fn take_food(
+    mut query: Query<(&Transform, &mut Ant, &mut Inventory, &mut Sprite)>,
+    mut food: ResMut<Food>,
+    time: Res<Time>,
+) {
+    food.update(&time.delta_seconds());
+    for (transform, mut ant, mut inventory, mut sprite) in &mut query {
+        if ant.state == SignalKind::Exploring {
+            let pos = transform.translation.truncate();
+            inventory.fill_from(pos, &mut food);
+            if inventory.is_full() {
+                ant.state = SignalKind::Retrieving;
+                sprite.color = Color::GREEN;
+            }
         }
     }
 }
+
+fn put_food(
+    mut food: ResMut<Food>,
+    buttons: Res<Input<MouseButton>>,
+    q_windows: Query<&Window, With<PrimaryWindow>>,
+) {
+    if buttons.pressed(MouseButton::Left) {
+        if let Some(mouse_pos) = q_windows.single().cursor_position() {
+            let world_pos = Vec2::new(mouse_pos.x - RESOLUTION.0/2., RESOLUTION.1/2. - mouse_pos.y) - Vec2::new(-140., 90.);
+            food.put(Rect::from_center_size(world_pos, Vec2::splat(50f32)), 10f32);
+        }
+    }
+}
+
+
