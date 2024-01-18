@@ -3,7 +3,7 @@ mod field;
 
 use ant::Ant;
 use ant::SignalKind;
-use bevy::prelude::*;
+use bevy::{prelude::*, sprite::MaterialMesh2dBundle};
 use bevy::window::PrimaryWindow;
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::*;
@@ -13,6 +13,16 @@ use field::Vec2Field;
 use rand_core::RngCore;
 
 const RESOLUTION: (f32, f32) = (1920f32, 1080f32);
+
+const NEST_CENTER: Vec2 = Vec2 { x: 576f32, y: 324f32 };
+const NEST_RADIUS_SQ: f32 = 10000.0;
+const MAX_FOOD_HEIGHT: f32 = 10.0;
+
+
+fn is_in_nest(&pos: &Vec2) -> bool {
+    (pos - NEST_CENTER).length_squared() < NEST_RADIUS_SQ 
+}
+
 
 #[derive(Component)]
 struct Inventory {
@@ -46,6 +56,13 @@ impl Inventory {
             self.contents += available;
         }
     }
+
+    pub fn dropoff(&mut self, position: Vec2, sink: &mut Food) {
+        let current = sink.amount.get_cell_value(position);
+        let available = self.contents.clamp(0., MAX_FOOD_HEIGHT - current);
+        sink.deposit_into(position, available);
+        self.contents -= available;
+    }
 }
 
 fn main() {
@@ -54,6 +71,7 @@ fn main() {
 
 fn sim() {
     App::new()
+        .insert_resource(ClearColor(Color::rgb(0.1, 0.25, 0.0)))
         .insert_resource(Signals {
             exploring: Vec2Field::new(
                 SignalKind::Exploring,
@@ -88,6 +106,8 @@ fn setup(
     mut commands: Commands,
     mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
     mut food: ResMut<Food>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     let mut primary_window = windows.single_mut();
 
@@ -114,7 +134,7 @@ fn setup(
             SpriteBundle {
                 sprite: Sprite {
                     rect: Some(cell.region),
-                    color: Color::rgb(0., 0.0, cell.val/10.0),
+                    color: Color::rgba(0.7, 0.7, 0.0, cell.val/10.0),
                     ..default()
                 },
                 transform: Transform::from_xyz(cell.region.center().x, cell.region.center().y, -0.1),
@@ -122,6 +142,13 @@ fn setup(
             }
         ));
     }
+
+    commands.spawn(MaterialMesh2dBundle {
+        mesh: meshes.add(shape::Circle::new(NEST_RADIUS_SQ.sqrt()).into()).into(),
+        material: materials.add(ColorMaterial::from(Color::PURPLE)),
+        transform: Transform::from_translation(NEST_CENTER.extend(-0.5)),
+        ..default()
+    });
 }
 
 struct EntityFactories;
@@ -130,14 +157,13 @@ impl EntityFactories {
     pub fn ant_factory(
         rng: &mut ResMut<GlobalEntropy<ChaCha8Rng>>,
     ) -> (SpriteBundle, Ant, Inventory) {
-        let x = 0.8 * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5) * RESOLUTION.0;
-        let y = 0.8 * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5) * RESOLUTION.1;
-        let theta = 360f32.to_radians() * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5);
+        let r = 200.0 * (rng.next_u32() as f32 / u32::MAX as f32);
+        let theta = 360f32.to_radians() * (rng.next_u32() as f32 / u32::MAX as f32);
+        let heading = 360f32.to_radians() * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5);
         let mut ant = Ant::new();
-        ant.position.x = x;
-        ant.position.y = y;
+        ant.position = r * Vec2::from_angle(theta) + NEST_CENTER;
 
-        ant.velocity = ant.velocity.rotate(Vec2::from_angle(theta));
+        ant.velocity = ant.velocity.rotate(Vec2::from_angle(heading));
         ant.state = SignalKind::Exploring;
 
         (
@@ -161,17 +187,23 @@ impl EntityFactories {
 fn update_ants(
     mut signals: ResMut<Signals>,
     mut query: Query<(&mut Transform, &mut Ant, &mut Inventory, &mut Sprite)>,
+    mut food: ResMut<Food>,
     time: Res<Time>,
 ) {
     let dt = time.delta_seconds();
     signals.update(&dt);
     for (mut transform, mut ant, mut inventory, mut sprite) in &mut query {
-        inventory.contents = inventory.contents - 0.1 * dt;
-        inventory.contents = inventory.contents.max(0f32);
+        let position = transform.translation.truncate();
+        if is_in_nest(&position) {
+            if inventory.is_full() {
+                inventory.dropoff(position, &mut food);
+            }    
+        }
         if !inventory.is_full() {
             ant.state = SignalKind::Exploring;
             sprite.color = Color::RED;
         }
+        
         let old_heading = ant.velocity.normalize();
         ant.update(&mut signals, &dt);
         let res = Vec2::new(RESOLUTION.0, RESOLUTION.1);
@@ -192,7 +224,7 @@ fn update_cells(
 ) {
     for (mut cell, mut sprite) in &mut query {
         cell.read_from(&food.amount);
-        sprite.color.set_b(cell.val/10f32);
+        sprite.color.set_a(cell.val/10f32);
     }
 }
 
@@ -214,7 +246,9 @@ fn take_food(
     for (transform, mut ant, mut inventory, mut sprite) in &mut query {
         if ant.state == SignalKind::Exploring {
             let pos = transform.translation.truncate();
-            inventory.fill_from(pos, &mut food);
+            if !is_in_nest(&pos) {
+                inventory.fill_from(pos, &mut food);
+            }
             if inventory.is_full() {
                 ant.state = SignalKind::Retrieving;
                 sprite.color = Color::GREEN;
@@ -230,7 +264,12 @@ fn put_food(
 ) {
     if buttons.pressed(MouseButton::Left) {
         if let Some(mouse_pos) = q_windows.single().cursor_position() {
-            let world_pos = Vec2::new(mouse_pos.x - RESOLUTION.0/2., RESOLUTION.1/2. - mouse_pos.y) - Vec2::new(-140., 90.);
+            
+            let world_pos = Vec2::new(
+                mouse_pos.x - RESOLUTION.0/2., 
+                RESOLUTION.1/2. - mouse_pos.y,
+            ) - Vec2::new(-140., 90.);
+
             food.put(Rect::from_center_size(world_pos, Vec2::splat(50f32)), 10f32);
         }
     }

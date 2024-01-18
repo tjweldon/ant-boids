@@ -86,6 +86,10 @@ impl Food {
         }
     }
 
+    pub fn deposit_into(&mut self, pos: Vec2, amount: f32) {
+        self.amount.acc_cell_value(amount, pos);
+    }
+
     pub fn update(&mut self, &dt: &f32) {
         self.amount.update(0.0001, 0., &dt);
     }
@@ -151,6 +155,7 @@ impl LatticeIndexer {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Resource)]
 pub struct Vec2Field<T: Copy + Clone + Debug> {
     pub kind: T,
@@ -159,6 +164,7 @@ pub struct Vec2Field<T: Copy + Clone + Debug> {
     cell_cache: Vec<Vec2Cell>,
 }
 
+#[allow(dead_code)]
 impl<T: Copy + Clone + Debug> Vec2Field<T> {
     pub fn new(kind: T, lattice: Vec2, size: Vec2) -> Self {
         Self {
@@ -357,6 +363,9 @@ impl<T: Copy + Clone + Debug> Field<T> {
         #[allow(non_snake_case)]
         let (A, B): (f32, f32) = (1., 0.5 * std::f32::consts::FRAC_1_SQRT_2);
 
+        let coeffs = [A / (A + B), B / (A + B)];
+        let evap_factor = (1. - evapouration_rate).powf(dt);
+
         let mut new_cells = vec![0f32; self.cells.len()];
         for (x, y) in (0..self.cells.len()).map(|i| self.dimensions.to_grid(i).unwrap_or((0, 0))) {
             let lx = match x == 0 {
@@ -381,14 +390,14 @@ impl<T: Copy + Clone + Debug> Field<T> {
             );
 
             let neighbour_avg =
-                0.25 * (A / (A + B) * (l + b + r + t) + B / (A + B) * (bl + br + tl + tr));
+                0.25 * (coeffs[0] * (l + b + r + t) + coeffs[1] * (bl + br + tl + tr));
 
             let current = self.wrapped_value_lookup(x, y);
             let change = diffusion_rate * dt * (neighbour_avg - current);
             let Some(linear) = self.dimensions.to_linear((x, y)) else {
                 continue;
             };
-            new_cells[linear] = (current + change) * (1. - evapouration_rate).powf(dt);
+            new_cells[linear] = (current + change) * evap_factor;
         }
 
         self.cells = new_cells;
